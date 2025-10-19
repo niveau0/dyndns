@@ -20,13 +20,18 @@ struct DnsRecord {
 
 #[derive(Serialize)]
 struct UpdateRecord<'a> {
-    value: &'a str,
+    name: String,
     ttl: u32,
+    #[serde(rename = "type")]
+    record_type: String,
+    value: &'a str,
+    zone_id: String,
 }
 
-async fn get_current_ip() -> Result<String, Box<dyn std::error::Error>> {
-    let ip = reqwest::get("https://api.ipify.org").await?.text().await?;
-    Ok(ip)
+async fn get_current_ip() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let ipv4 = reqwest::get("https://api.ipify.org").await?.text().await?;
+    let ipv6 = reqwest::get("https://api6.ipify.org").await?.text().await?;
+    Ok((ipv4, ipv6))
 }
 
 async fn update_dns_record(
@@ -38,13 +43,16 @@ async fn update_dns_record(
     let url = format!("https://dns.hetzner.com/api/v1/records/{}", record.id);
 
     let payload = UpdateRecord {
-        value: new_ip,
+        name: record.name.clone(),
         ttl: 60,
+        record_type: record.record_type.clone(),
+        value: new_ip,
+        zone_id: record.zone_id.clone(),
     };
 
     client
         .put(&url)
-        .bearer_auth(token)
+        .header("Auth-API-Token".to_string(), token.to_string())
         .json(&payload)
         .send()
         .await?
@@ -55,8 +63,6 @@ async fn update_dns_record(
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv::dotenv()?;
-
     let token = env::var("HETZNER_DNS_TOKEN")?;
     let zone_id = env::var("ZONE_ID")?;
     let record_name = env::var("RECORD_NAME")?;
@@ -65,28 +71,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let ip = get_current_ip().await?;
+        println!("Current ipv4: {}, ipv6: {}", ip.0, ip.1);
 
-        let resp = client
+        let query = client
             .get("https://dns.hetzner.com/api/v1/records")
-            .bearer_auth(&token)
-            .query(&[("zone_id", &zone_id)])
-            .send()
-            .await?
-            .json::<RecordList>()
-            .await?;
+            .header("Auth-API-Token".to_string(), token.clone())
+            .query(&[("zone_id", &zone_id)]);
+        let resp = query.send().await?;
+        let resp = resp.json::<RecordList>().await?;
 
-        if let Some(record) = resp
-            .records
-            .iter()
-            .find(|r| r.name == record_name && r.record_type == "A")
-        {
-            if record.value != ip {
-                update_dns_record(&client, &token, record, &ip).await?;
-            } else {
-                println!("Identical IP, no update required");
+        for record in resp.records.iter().filter(|r| r.name == record_name) {
+            match record.record_type.as_str() {
+                "A" => {
+                    if record.value != ip.0 {
+                        update_dns_record(&client, &token, record, &ip.0).await?;
+                    } else {
+                        println!("Identical IPv4, no update required");
+                    }
+                }
+
+                "AAAA" => {
+                    if record.value != ip.1 {
+                        update_dns_record(&client, &token, record, &ip.1).await?;
+                    } else {
+                        println!("Identical IPv6, no update required");
+                    }
+                }
+                _ => (),
             }
-        } else {
-            println!("A-Record '{}' not found", record_name);
         }
 
         tokio::time::sleep(Duration::from_secs(300)).await;
